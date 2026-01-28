@@ -27,7 +27,10 @@ def _split_origins(raw: str) -> List[str]:
     return [o.strip() for o in (raw or "").split(",") if o.strip()]
 
 
-# Supabase config (required for authenticated endpoints).
+# Supabase config (required for endpoints backed by Supabase PostgREST).
+# NOTE: Some deployments may not provide SUPABASE_URL at process start; therefore we
+# initialize the Supabase client lazily using the env var at request-time to avoid
+# crashing /api/* and returning 500s.
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 
 # CORS:
@@ -337,15 +340,33 @@ def _validate_repair_status_update_permissions(user: UserContext, new_status: st
         )
 
 
-_supabase = SupabaseRestClient(supabase_url=SUPABASE_URL) if SUPABASE_URL else None
+_supabase: Optional[SupabaseRestClient] = None
+
+
+def _get_supabase() -> SupabaseRestClient:
+    """
+    Return a configured SupabaseRestClient.
+
+    This is intentionally lazy to prevent runtime 500s when SUPABASE_URL is present
+    at deployment time but not at module import time.
+    """
+    global _supabase
+    supabase_url = (os.getenv("SUPABASE_URL") or "").rstrip("/")
+    if not supabase_url:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="SUPABASE_URL is not configured. Ask orchestrator to set SUPABASE_URL.",
+        )
+    if _supabase is None or getattr(_supabase, "_rest_base", "").startswith("None"):
+        _supabase = SupabaseRestClient(supabase_url=supabase_url)
+    return _supabase
 
 
 async def _get_repair_current_status(repair_id: UUID, *, access_token: str) -> Optional[str]:
     """Fetch current status of a repair using caller JWT (RLS-scoped)."""
-    if _supabase is None:
-        raise RuntimeError("Supabase client not initialized.")
+    supabase = _get_supabase()
     headers = postgrest_headers_from_user(access_token=access_token)
-    rows = await _supabase.select(
+    rows = await supabase.select(
         "repairs",
         headers=headers,
         filters={"id": f"eq.{repair_id}"},
@@ -509,12 +530,11 @@ async def create_repair(
     payload: RepairCreateRequest,
     user: UserContext = Depends(get_current_user),
 ) -> RepairResponse:
-    if _supabase is None:
-        raise RuntimeError("Supabase client not initialized.")
+    supabase = _get_supabase()
     _require_role(user, ["customer", "admin"])  # admin allowed if RLS permits; otherwise will fail.
 
     headers = postgrest_headers_from_user(access_token=user.access_token)
-    rows = await _supabase.insert(
+    rows = await supabase.insert(
         "repairs",
         headers=headers,
         rows=[
@@ -556,7 +576,7 @@ async def list_my_repairs(user: UserContext = Depends(get_current_user)) -> List
     elif user.role == "technician":
         filters["technician_id"] = f"eq.{user.user_id}"
 
-    rows = await _supabase.select("repairs", headers=headers, filters=filters, order="created_at.desc")
+    rows = await supabase.select("repairs", headers=headers, filters=filters, order="created_at.desc")
     if not isinstance(rows, list):
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected list response.")
     return [RepairResponse(**r) for r in rows]
@@ -877,8 +897,7 @@ async def search_service_centers(
 # PUBLIC_INTERFACE
 async def api_list_brands() -> List[ApiBrandResponse]:
     """Return brands for Step 1 of booking flow (no auth required)."""
-    if _supabase is None:
-        raise RuntimeError("Supabase client not initialized.")
+    supabase = _get_supabase()
 
     # Public read: use anon key without requiring a user JWT.
     anon_key = os.getenv("SUPABASE_ANON_KEY") or ""
@@ -891,7 +910,7 @@ async def api_list_brands() -> List[ApiBrandResponse]:
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
-    rows = await _supabase.select("brands", headers=headers, order="name.asc")
+    rows = await supabase.select("brands", headers=headers, order="name.asc")
     if not isinstance(rows, list):
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected response.")
     return [ApiBrandResponse(**r) for r in rows]
@@ -912,8 +931,7 @@ async def api_list_brands() -> List[ApiBrandResponse]:
 # PUBLIC_INTERFACE
 async def api_list_models(brand_id: Optional[UUID] = Query(default=None, description="Brand id filter (UUID).")) -> List[ApiModelResponse]:
     """Return models for Step 2 of booking flow (no auth required)."""
-    if _supabase is None:
-        raise RuntimeError("Supabase client not initialized.")
+    supabase = _get_supabase()
 
     anon_key = os.getenv("SUPABASE_ANON_KEY") or ""
     if not anon_key:
@@ -930,7 +948,7 @@ async def api_list_models(brand_id: Optional[UUID] = Query(default=None, descrip
     if brand_id:
         filters["brand_id"] = f"eq.{brand_id}"
 
-    rows = await _supabase.select("models", headers=headers, filters=filters, order="name.asc")
+    rows = await supabase.select("models", headers=headers, filters=filters, order="name.asc")
     if not isinstance(rows, list):
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected response.")
     return [ApiModelResponse(**r) for r in rows]
@@ -965,7 +983,7 @@ async def api_list_issues() -> List[ApiIssueResponse]:
         "Accept": "application/json",
     }
 
-    rows = await _supabase.select("issues", headers=headers, order="name.asc")
+    rows = await supabase.select("issues", headers=headers, order="name.asc")
     if not isinstance(rows, list):
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected response.")
     return [ApiIssueResponse(**r) for r in rows]
@@ -990,8 +1008,7 @@ async def api_create_repair(
     user: UserContext = Depends(require_authenticated),
 ) -> ApiRepairResponse:
     """Create a repair booking for the current user under the user-request schema."""
-    if _supabase is None:
-        raise RuntimeError("Supabase client not initialized.")
+    supabase = _get_supabase()
 
     headers = postgrest_headers_from_user(access_token=user.access_token)
     status_value = (payload.status or "pending").strip() or "pending"
