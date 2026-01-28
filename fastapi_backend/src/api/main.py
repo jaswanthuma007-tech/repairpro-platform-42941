@@ -1,6 +1,6 @@
 import os
 from datetime import date, datetime, timedelta
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Union
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
@@ -170,6 +170,15 @@ class DeviceModelCreateRequest(BaseModel):
     name: str = Field(..., min_length=2, description="Device model name.")
 
 
+class IssueResponse(BaseModel):
+    """Issue record for booking flow (optional catalog)."""
+
+    id: UUID = Field(..., description="Issue id.")
+    device_model_id: UUID = Field(..., description="Device model id this issue belongs to.")
+    title: str = Field(..., description="Short issue title.")
+    description: Optional[str] = Field(None, description="Optional longer issue description.")
+
+
 class ServiceResponse(BaseModel):
     """Service record for booking catalog."""
 
@@ -293,6 +302,32 @@ def _validate_transition(old_status: str, new_status: str) -> None:
                 "allowed_next": sorted(list(allowed)),
             },
         )
+
+
+def _first_present_uuid(
+    *values: Optional[Union[str, UUID]],
+    param_name: str,
+) -> Optional[UUID]:
+    """
+    Return the first present UUID from a list of possible inputs.
+
+    Accepts either UUID objects or strings. Raises 422 if a provided non-empty value
+    cannot be parsed as UUID.
+    """
+    for v in values:
+        if v is None:
+            continue
+        if isinstance(v, UUID):
+            return v
+        if isinstance(v, str) and v.strip():
+            try:
+                return UUID(v.strip())
+            except Exception:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"Invalid UUID for '{param_name}': {v}",
+                )
+    return None
 
 
 @app.get(
@@ -665,6 +700,101 @@ async def list_services(user: UserContext = Depends(require_authenticated)) -> L
     if not isinstance(rows, list):
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected response.")
     return [ServiceResponse(**r) for r in rows]
+
+
+@app.get(
+    "/models",
+    tags=["Catalog"],
+    summary="List models (alias)",
+    description=(
+        "Alias for listing device models used by the booking stepper.\n\n"
+        "Compatibility:\n"
+        "- Supports `?brand=<uuid>` (legacy) and `?brand_id=<uuid>` (preferred).\n"
+        "Returns device models, optionally filtered by brand."
+    ),
+    operation_id="list_models_alias",
+    response_model=List[DeviceModelResponse],
+)
+# PUBLIC_INTERFACE
+async def list_models_alias(
+    user: UserContext = Depends(require_authenticated),
+    brand: Optional[str] = Query(default=None, description="Legacy brand id filter (UUID)."),
+    brand_id: Optional[UUID] = Query(default=None, description="Optional brand id filter (UUID)."),
+) -> List[DeviceModelResponse]:
+    """Compatibility endpoint for booking flow: list models by brand."""
+    selected_brand_id = _first_present_uuid(brand_id, brand, param_name="brand/brand_id")
+
+    # Delegate to the canonical handler so behavior stays consistent.
+    return await list_device_models(user=user, brand_id=selected_brand_id)
+
+
+@app.get(
+    "/issues",
+    tags=["Catalog"],
+    summary="List issues (booking catalog)",
+    description=(
+        "Returns issues for a given model.\n\n"
+        "Compatibility:\n"
+        "- Supports `?model=<uuid>` (legacy) and `?device_model_id=<uuid>` (preferred).\n\n"
+        "Implementation note: if your Supabase project does not include an `issues` table yet, "
+        "this endpoint returns an empty list instead of failing the booking flow."
+    ),
+    operation_id="list_issues",
+    response_model=List[IssueResponse],
+)
+# PUBLIC_INTERFACE
+async def list_issues(
+    user: UserContext = Depends(require_authenticated),
+    model: Optional[str] = Query(default=None, description="Legacy device model id filter (UUID)."),
+    device_model_id: Optional[UUID] = Query(default=None, description="Device model id filter (UUID)."),
+) -> List[IssueResponse]:
+    """List issues for booking; gracefully degrades to empty list if table is absent."""
+    if _supabase is None:
+        raise RuntimeError("Supabase client not initialized.")
+    selected_model_id = _first_present_uuid(device_model_id, model, param_name="model/device_model_id")
+    if selected_model_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Missing required query parameter: model (or device_model_id).",
+        )
+
+    headers = postgrest_headers_from_user(access_token=user.access_token)
+    filters = {"device_model_id": f"eq.{selected_model_id}"}
+
+    try:
+        rows = await _supabase.select("issues", headers=headers, filters=filters, order="title.asc")
+    except HTTPException as e:
+        # If the table doesn't exist yet (common during incremental schema rollout),
+        # avoid breaking the entire booking stepper.
+        if e.status_code in (400, 404):
+            return []
+        raise
+
+    if not isinstance(rows, list):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected response.")
+    return [IssueResponse(**r) for r in rows]
+
+
+@app.get(
+    "/repairs/assigned",
+    tags=["Repairs"],
+    summary="List assigned repairs (technician alias)",
+    description=(
+        "Alias for technicians to list assigned repairs.\n\n"
+        "This matches the frontend's historical expectation: GET /repairs/assigned.\n"
+        "Under the hood it returns the same data as GET /repairs/jobs for the current technician."
+    ),
+    operation_id="list_assigned_repairs",
+    response_model=List[RepairResponse],
+)
+# PUBLIC_INTERFACE
+async def list_assigned_repairs(
+    user: UserContext = Depends(require_technician_or_admin),
+    status_filter: Optional[str] = Query(default=None, description="Optional status filter (exact match)."),
+) -> List[RepairResponse]:
+    """Compatibility endpoint: list assigned jobs for technicians/admins."""
+    # Delegate to canonical jobs endpoint implementation.
+    return await list_jobs(user=user, status_filter=status_filter)
 
 
 @app.post(
