@@ -33,7 +33,12 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 # - In production, set CORS_ALLOW_ORIGINS to your deployed frontend URL(s).
 # - Comma-separated, e.g.: "http://localhost:3000,https://app.example.com"
 # - If unset, the API defaults to localhost:3000 origins for development.
+#
+# This repo's frontend container commonly exposes the frontend URL as REACT_APP_FRONTEND_URL.
+# We accept that too so local/prod environments work without requiring an extra variable.
 CORS_ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "")
+REACT_APP_FRONTEND_URL = os.getenv("REACT_APP_FRONTEND_URL", "")
+REACT_APP_BACKEND_URL = os.getenv("REACT_APP_BACKEND_URL", "")
 
 openapi_tags = [
     {"name": "System", "description": "Health checks and operational endpoints."},
@@ -59,12 +64,20 @@ app = FastAPI(
     openapi_tags=openapi_tags,
 )
 
-# CORS policy: default to safe development origins if CORS_ALLOW_ORIGINS is unset.
+# CORS policy:
+# - Prefer explicit CORS_ALLOW_ORIGINS (comma-separated).
+# - Otherwise fall back to frontend URL env (REACT_APP_FRONTEND_URL) if present.
+# - Finally default to safe development origins.
 _default_dev_origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
 ]
-_allowed_origins = _split_origins(CORS_ALLOW_ORIGINS) or _default_dev_origins
+
+_env_frontend_origins = _split_origins(REACT_APP_FRONTEND_URL)
+
+# Some deployments accidentally set backend URL vars; do not treat them as valid browser origins.
+# (Keeping the variable read above to help operators discover misconfiguration via /docs/auth.)
+_allowed_origins = _split_origins(CORS_ALLOW_ORIGINS) or _env_frontend_origins or _default_dev_origins
 
 app.add_middleware(
     CORSMiddleware,
@@ -598,6 +611,7 @@ async def admin_assign_technician(
     operation_id="list_brands",
     response_model=List[BrandResponse],
 )
+# PUBLIC_INTERFACE
 async def list_brands(user: UserContext = Depends(require_authenticated)) -> List[BrandResponse]:
     if _supabase is None:
         raise RuntimeError("Supabase client not initialized.")
