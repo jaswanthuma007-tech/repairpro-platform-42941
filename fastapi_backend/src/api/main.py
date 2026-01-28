@@ -1,5 +1,5 @@
 import os
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Set
 from uuid import UUID
 
@@ -20,27 +20,28 @@ def _require_env(name: str) -> str:
     return value
 
 
+def _split_origins(raw: str) -> List[str]:
+    """Parse a comma-separated list of CORS origins into a clean list."""
+    return [o.strip() for o in (raw or "").split(",") if o.strip()]
+
+
+# Supabase config (required for authenticated endpoints).
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 
+# CORS: in production, set CORS_ALLOW_ORIGINS to your deployed frontend URL(s).
+# Comma-separated, e.g.: "http://localhost:3000,https://app.example.com"
+CORS_ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "")
+
 openapi_tags = [
-    {
-        "name": "System",
-        "description": "Health checks and operational endpoints.",
-    },
+    {"name": "System", "description": "Health checks and operational endpoints."},
     {
         "name": "Catalog",
         "description": "Read-only catalog data (brands, device models, services) used by booking flow.",
     },
-    {
-        "name": "Repairs",
-        "description": "Customer booking and tracking, technician status updates.",
-    },
-    {
-        "name": "Admin",
-        "description": "Administrative repair assignment and catalog management.",
-    },
+    {"name": "Repairs", "description": "Customer booking and tracking, technician status updates."},
+    {"name": "Admin", "description": "Administrative repair assignment and catalog management."},
 ]
 
 app = FastAPI(
@@ -48,8 +49,7 @@ app = FastAPI(
     description=(
         "Backend API for booking repairs and tracking repair status.\n\n"
         "Authentication: Supabase JWT (send `Authorization: Bearer <access_token>`).\n"
-        "Authorization: Role-based via `profiles.role` (customer/technician/admin).\n"
-        "\n"
+        "Authorization: Role-based via `profiles.role` (customer/technician/admin).\n\n"
         "Note: Most data access relies on Supabase Row Level Security (RLS). "
         "Admin-only endpoints may use the Supabase service role key server-side to bypass RLS, "
         "and therefore MUST enforce admin role in this API.\n"
@@ -58,9 +58,16 @@ app = FastAPI(
     openapi_tags=openapi_tags,
 )
 
+# CORS policy: default to safe development origins if CORS_ALLOW_ORIGINS is unset.
+_default_dev_origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+_allowed_origins = _split_origins(CORS_ALLOW_ORIGINS) or _default_dev_origins
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, restrict to your frontend origin(s).
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -104,44 +111,6 @@ class RepairResponse(BaseModel):
     updated_at: Optional[datetime] = Field(None, description="Last update time.")
 
 
-# Allowed statuses should match DB constraint/enum (kept here to provide clear API errors).
-_ALLOWED_REPAIR_STATUSES: Set[str] = {
-    "pending",
-    "accepted",
-    "in_progress",
-    "completed",
-    "cancelled",
-}
-
-
-def _validate_repair_status_value(status_value: str) -> None:
-    """Validate status value and raise a 422 with a helpful message if invalid."""
-    if status_value not in _ALLOWED_REPAIR_STATUSES:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={
-                "message": "Invalid status value.",
-                "allowed": sorted(_ALLOWED_REPAIR_STATUSES),
-                "received": status_value,
-            },
-        )
-
-
-def _validate_repair_status_update_permissions(user: UserContext, new_status: str) -> None:
-    """
-    Enforce basic business rules by role.
-
-    Note: RLS remains the source of truth for *which* repair rows a user can modify.
-    This function enforces *what* transitions/values are permitted by role.
-    """
-    # Technicians/admin can update status, but technician shouldn't set "cancelled" (customer/admin action).
-    if user.role == "technician" and new_status == "cancelled":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Technicians cannot set status to 'cancelled'.",
-        )
-
-
 class RepairStatusUpdateRequest(BaseModel):
     """Payload to update a repair's status."""
 
@@ -155,14 +124,11 @@ class AdminRepairAnalyticsResponse(BaseModel):
     """Admin analytics summary across repairs."""
 
     total_repairs: int = Field(..., description="Total repairs in the system.")
-    by_status: Dict[str, int] = Field(
-        ..., description="Counts of repairs grouped by status."
-    )
+    by_status: Dict[str, int] = Field(..., description="Counts of repairs grouped by status.")
     by_day_last_14d: List[Dict[str, Any]] = Field(
         ...,
         description=(
-            "Daily counts for last 14 days. "
-            "Each item contains: {date: 'YYYY-MM-DD', count: int}."
+            "Daily counts for last 14 days. Each item contains: {date: 'YYYY-MM-DD', count: int}."
         ),
     )
 
@@ -225,6 +191,82 @@ class RepairStatusHistoryResponse(BaseModel):
     created_at: Optional[datetime] = Field(None, description="Timestamp of status change.")
 
 
+# Allowed statuses should match DB constraint/enum (kept here to provide clear API errors).
+_ALLOWED_REPAIR_STATUSES: Set[str] = {
+    "pending",
+    "accepted",
+    "in_progress",
+    "completed",
+    "cancelled",
+}
+
+# Business transitions to prevent invalid state changes from API clients.
+# Note: DB can still be the ultimate authority; this is API hardening for clearer errors.
+_ALLOWED_TRANSITIONS: Dict[str, Set[str]] = {
+    "pending": {"accepted", "cancelled"},
+    "accepted": {"in_progress", "cancelled"},
+    "in_progress": {"completed", "cancelled"},
+    "completed": set(),
+    "cancelled": set(),
+}
+
+
+def _validate_repair_status_value(status_value: str) -> None:
+    """Validate status value and raise a 422 with a helpful message if invalid."""
+    if status_value not in _ALLOWED_REPAIR_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "message": "Invalid status value.",
+                "allowed": sorted(_ALLOWED_REPAIR_STATUSES),
+                "received": status_value,
+            },
+        )
+
+
+def _require_role(user: UserContext, allowed: List[str]) -> None:
+    """Raise 403 if user's role isn't permitted."""
+    if user.role not in allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Insufficient role. Required one of: {allowed}.",
+        )
+
+
+def _validate_repair_status_update_permissions(user: UserContext, new_status: str) -> None:
+    """
+    Enforce basic business rules by role.
+
+    Note: RLS remains the source of truth for *which* repair rows a user can modify.
+    This function enforces *what* transitions/values are permitted by role.
+    """
+    # Technicians/admin can update status, but technician shouldn't set "cancelled" (customer/admin action).
+    if user.role == "technician" and new_status == "cancelled":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Technicians cannot set status to 'cancelled'.",
+        )
+
+
+def _require_supabase_for_user_endpoints() -> None:
+    """Validate required env vars for endpoints that call Supabase with a user JWT."""
+    if not SUPABASE_URL:
+        raise RuntimeError("SUPABASE_URL is not configured. Ask orchestrator to set SUPABASE_URL.")
+    if not SUPABASE_ANON_KEY:
+        raise RuntimeError(
+            "SUPABASE_ANON_KEY is not configured. Ask orchestrator to set SUPABASE_ANON_KEY."
+        )
+
+
+def _require_supabase_service_role() -> None:
+    """Validate required env vars for endpoints that must use the service role."""
+    _require_supabase_for_user_endpoints()
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        raise RuntimeError(
+            "SUPABASE_SERVICE_ROLE_KEY is not configured. Ask orchestrator to set SUPABASE_SERVICE_ROLE_KEY."
+        )
+
+
 class SupabaseRestClient:
     """Minimal Supabase PostgREST client with correct headers for RLS-aware access."""
 
@@ -248,7 +290,6 @@ class SupabaseRestClient:
         async with httpx.AsyncClient(timeout=20) as client:
             resp = await client.request(method, url, headers=headers, params=params, json=json)
         if resp.status_code >= 400:
-            # Supabase returns JSON with message/details on many errors.
             detail: Any
             try:
                 detail = resp.json()
@@ -257,7 +298,6 @@ class SupabaseRestClient:
             raise HTTPException(status_code=resp.status_code, detail=detail)
         if resp.status_code == status.HTTP_204_NO_CONTENT:
             return None
-        # For PostgREST, successful responses are JSON arrays or objects.
         try:
             return resp.json()
         except Exception as e:
@@ -320,10 +360,7 @@ def _postgrest_headers_from_user(token: str) -> Dict[str, str]:
     Build headers for Supabase PostgREST with the user's JWT.
     Uses anon key as apikey (required by Supabase gateway) and JWT for RLS.
     """
-    if not SUPABASE_ANON_KEY:
-        raise RuntimeError(
-            "SUPABASE_ANON_KEY is not configured. Ask orchestrator to set SUPABASE_ANON_KEY."
-        )
+    _require_supabase_for_user_endpoints()
     return {
         "apikey": SUPABASE_ANON_KEY,
         "Authorization": f"Bearer {token}",
@@ -337,10 +374,7 @@ def _postgrest_headers_service_role() -> Dict[str, str]:
     Build headers for Supabase PostgREST using the service role key.
     IMPORTANT: Only use server-side. This bypasses RLS, so we must enforce role checks in the API.
     """
-    if not SUPABASE_SERVICE_ROLE_KEY:
-        raise RuntimeError(
-            "SUPABASE_SERVICE_ROLE_KEY is not configured. Ask orchestrator to set SUPABASE_SERVICE_ROLE_KEY."
-        )
+    _require_supabase_service_role()
     return {
         "apikey": SUPABASE_SERVICE_ROLE_KEY,
         "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
@@ -351,10 +385,7 @@ def _postgrest_headers_service_role() -> Dict[str, str]:
 
 async def _get_supabase_user(access_token: str) -> Dict[str, Any]:
     """Call Supabase Auth API to validate JWT and return user payload."""
-    if not SUPABASE_URL:
-        raise RuntimeError("SUPABASE_URL is not configured.")
-    if not SUPABASE_ANON_KEY:
-        raise RuntimeError("SUPABASE_ANON_KEY is not configured.")
+    _require_supabase_for_user_endpoints()
 
     url = f"{SUPABASE_URL}/auth/v1/user"
     headers = {
@@ -399,6 +430,47 @@ async def _get_user_role(user_id: UUID, access_token: str) -> str:
     return "customer"
 
 
+async def _get_repair_current_status(repair_id: UUID, *, access_token: str) -> Optional[str]:
+    """Fetch current status of a repair using caller JWT (RLS-scoped)."""
+    if _supabase is None:
+        raise RuntimeError("Supabase client not initialized.")
+    headers = _postgrest_headers_from_user(access_token)
+    rows = await _supabase.select(
+        "repairs",
+        headers=headers,
+        filters={"id": f"eq.{repair_id}"},
+        select="status",
+        limit=1,
+    )
+    if not isinstance(rows, list):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected response.")
+    if not rows:
+        return None
+    st = rows[0].get("status")
+    return st if isinstance(st, str) else None
+
+
+def _validate_transition(old_status: str, new_status: str) -> None:
+    """Validate status transition; raise 409 for disallowed transitions."""
+    allowed = _ALLOWED_TRANSITIONS.get(old_status)
+    if allowed is None:
+        # If DB contains unexpected status, treat as conflict for safety.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cannot transition from unknown status '{old_status}'.",
+        )
+    if new_status not in allowed:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": "Invalid status transition.",
+                "from": old_status,
+                "to": new_status,
+                "allowed_next": sorted(list(allowed)),
+            },
+        )
+
+
 # PUBLIC_INTERFACE
 async def get_current_user(authorization: Optional[str] = Header(default=None)) -> UserContext:
     """FastAPI dependency: validate Supabase JWT and return user context (id/email/role)."""
@@ -423,15 +495,6 @@ async def get_current_user(authorization: Optional[str] = Header(default=None)) 
         role=role,
         access_token=token,
     )
-
-
-def _require_role(user: UserContext, allowed: List[str]) -> None:
-    """Raise 403 if user's role isn't permitted."""
-    if user.role not in allowed:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Insufficient role. Required one of: {allowed}.",
-        )
 
 
 # PUBLIC_INTERFACE
@@ -493,7 +556,20 @@ def docs_auth_guide() -> Dict[str, Any]:
         "authorization": {
             "roles": ["customer", "technician", "admin"],
             "source": "public.profiles.role (looked up using the user's JWT under RLS).",
-            "service_role_note": "Admin endpoints may use SUPABASE_SERVICE_ROLE_KEY server-side to bypass RLS; API enforces admin role.",
+            "service_role_note": (
+                "Admin endpoints may use SUPABASE_SERVICE_ROLE_KEY server-side to bypass RLS; "
+                "API strictly enforces admin role."
+            ),
+        },
+        "cors": {
+            "allow_origins": _allowed_origins,
+            "note": "Configure CORS_ALLOW_ORIGINS as a comma-separated list for production.",
+        },
+        "required_env": {
+            "SUPABASE_URL": "Supabase project URL",
+            "SUPABASE_ANON_KEY": "Supabase anon key (safe for clients; used here for gateway)",
+            "SUPABASE_SERVICE_ROLE_KEY": "Backend-only service role key (admin endpoints)",
+            "CORS_ALLOW_ORIGINS": "Optional. Comma-separated origins. Defaults to localhost:3000 in dev.",
         },
     }
 
@@ -618,7 +694,6 @@ async def get_repair_history(
         raise RuntimeError("Supabase client not initialized.")
     headers = _postgrest_headers_from_user(user.access_token)
 
-    # In schema, repair_status_history has repair_id FK and RLS aligned with repair visibility.
     rows = await _supabase.select(
         "repair_status_history",
         headers=headers,
@@ -643,10 +718,7 @@ async def get_repair_history(
 )
 async def list_jobs(
     user: UserContext = Depends(require_technician_or_admin),
-    status_filter: Optional[str] = Query(
-        default=None,
-        description="Optional status filter (exact match).",
-    ),
+    status_filter: Optional[str] = Query(default=None, description="Optional status filter (exact match)."),
 ) -> List[RepairResponse]:
     if _supabase is None:
         raise RuntimeError("Supabase client not initialized.")
@@ -674,6 +746,7 @@ async def list_jobs(
         "Admins can update any repair (if RLS allows; otherwise use admin assignment endpoint with service role).\n\n"
         "Server-side validation:\n"
         "- status must be one of the allowed values\n"
+        "- transition must be valid (e.g. pending -> accepted -> in_progress -> completed)\n"
         "- technicians cannot set status to 'cancelled'\n"
     ),
     operation_id="update_repair_status",
@@ -690,9 +763,22 @@ async def update_repair_status(
     _validate_repair_status_value(payload.status)
     _validate_repair_status_update_permissions(user, payload.status)
 
+    # Fetch current status (RLS-scoped) to validate transition and provide clearer errors.
+    current_status = await _get_repair_current_status(repair_id, access_token=user.access_token)
+    if current_status is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Repair not found or not permitted by RLS.",
+        )
+    if current_status == payload.status:
+        # Idempotent update: return current repair state by re-selecting full row.
+        return await get_repair(repair_id, user=user)
+
+    _validate_transition(current_status, payload.status)
+
     headers = _postgrest_headers_from_user(user.access_token)
 
-    # Let DB triggers manage updated_at and history logging where applicable.
+    # Let DB triggers manage updated_at and history logging.
     rows = await _supabase.update(
         "repairs",
         headers=headers,
@@ -727,11 +813,12 @@ async def admin_assign_technician(
         raise RuntimeError("Supabase client not initialized.")
     headers = _postgrest_headers_service_role()
 
+    # Do NOT override updated_at in API; rely on DB triggers/defaults for consistency.
     rows = await _supabase.update(
         "repairs",
         headers=headers,
         filters={"id": f"eq.{repair_id}"},
-        patch={"technician_id": str(payload.technician_id), "updated_at": datetime.utcnow().isoformat()},
+        patch={"technician_id": str(payload.technician_id)},
     )
     if not isinstance(rows, list) or not rows:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Repair not found.")
@@ -871,10 +958,17 @@ async def admin_create_service(
         rows=[{"name": payload.name, "base_price": payload.base_price}],
     )
     if not isinstance(rows, list) or not rows:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected create response."
-        )
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected create response.")
     return ServiceResponse(**rows[0])
+
+
+def _init_14d_buckets(today: date) -> Dict[str, int]:
+    """Create 14-day inclusive buckets keyed by ISO date string."""
+    buckets: Dict[str, int] = {}
+    for i in range(14):
+        d = today - timedelta(days=i)
+        buckets[d.isoformat()] = 0
+    return buckets
 
 
 @app.get(
@@ -895,8 +989,6 @@ async def admin_repairs_analytics(admin: UserContext = Depends(require_admin)) -
 
     headers = _postgrest_headers_service_role()
 
-    # 1) Fetch all repairs (id/status/created_at) for aggregation.
-    # For modest data sizes this is fine; for large datasets consider a SQL RPC.
     rows = await _supabase.select(
         "repairs",
         headers=headers,
@@ -904,9 +996,7 @@ async def admin_repairs_analytics(admin: UserContext = Depends(require_admin)) -
         order="created_at.desc",
     )
     if not isinstance(rows, list):
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected response."
-        )
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected response.")
 
     total = len(rows)
     by_status: Dict[str, int] = {}
@@ -914,20 +1004,14 @@ async def admin_repairs_analytics(admin: UserContext = Depends(require_admin)) -
         st = r.get("status") or "unknown"
         by_status[st] = by_status.get(st, 0) + 1
 
-    # 2) 14d daily counts (in-memory bucketing). created_at may be null in some cases.
-    # We keep response shape stable for frontend charting.
     today = datetime.utcnow().date()
-    day_buckets: Dict[str, int] = {}
-    for i in range(14):
-        d = (today).fromordinal(today.toordinal() - i)
-        day_buckets[d.isoformat()] = 0
+    day_buckets = _init_14d_buckets(today)
 
     for r in rows:
         created_at = r.get("created_at")
         if not created_at:
             continue
         try:
-            # created_at is ISO string from PostgREST
             d = datetime.fromisoformat(created_at.replace("Z", "+00:00")).date()
         except Exception:
             continue
@@ -942,3 +1026,10 @@ async def admin_repairs_analytics(admin: UserContext = Depends(require_admin)) -
         by_status=by_status,
         by_day_last_14d=by_day_last_14d,
     )
+
+
+# Ensure OpenAPI is always reachable at /openapi.json (some deployments rely on it explicitly).
+@app.get("/openapi.json", include_in_schema=False)
+def openapi_json() -> Dict[str, Any]:
+    """Return the generated OpenAPI schema."""
+    return app.openapi()
