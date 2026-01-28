@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional
 from uuid import UUID
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -30,15 +30,18 @@ openapi_tags = [
         "description": "Health checks and operational endpoints.",
     },
     {
+        "name": "Catalog",
+        "description": "Read-only catalog data (brands, device models, services) used by booking flow.",
+    },
+    {
         "name": "Repairs",
         "description": "Customer booking and tracking, technician status updates.",
     },
     {
         "name": "Admin",
-        "description": "Administrative repair assignment and oversight.",
+        "description": "Administrative repair assignment and catalog management.",
     },
 ]
-
 
 app = FastAPI(
     title="RepairPro / Mobile Service Center API",
@@ -46,6 +49,10 @@ app = FastAPI(
         "Backend API for booking repairs and tracking repair status.\n\n"
         "Authentication: Supabase JWT (send `Authorization: Bearer <access_token>`).\n"
         "Authorization: Role-based via `profiles.role` (customer/technician/admin).\n"
+        "\n"
+        "Note: Most data access relies on Supabase Row Level Security (RLS). "
+        "Admin-only endpoints may use the Supabase service role key server-side to bypass RLS, "
+        "and therefore MUST enforce admin role in this API.\n"
     ),
     version="0.1.0",
     openapi_tags=openapi_tags,
@@ -100,13 +107,68 @@ class RepairResponse(BaseModel):
 class RepairStatusUpdateRequest(BaseModel):
     """Payload to update a repair's status."""
 
-    status: str = Field(..., description="New status (e.g. pending, accepted, in_progress, completed, cancelled).")
+    status: str = Field(
+        ...,
+        description="New status (e.g. pending, accepted, in_progress, completed, cancelled).",
+    )
 
 
 class AssignTechnicianRequest(BaseModel):
     """Admin payload to assign a technician to a repair."""
 
     technician_id: UUID = Field(..., description="User id of technician to assign.")
+
+
+class BrandResponse(BaseModel):
+    """Brand record for booking catalog."""
+
+    id: UUID = Field(..., description="Brand id.")
+    name: str = Field(..., description="Brand name.")
+
+
+class BrandCreateRequest(BaseModel):
+    """Admin payload to create a brand."""
+
+    name: str = Field(..., min_length=2, description="Brand name.")
+
+
+class DeviceModelResponse(BaseModel):
+    """Device model record for booking catalog."""
+
+    id: UUID = Field(..., description="Device model id.")
+    brand_id: UUID = Field(..., description="Brand id this model belongs to.")
+    name: str = Field(..., description="Device model name.")
+
+
+class DeviceModelCreateRequest(BaseModel):
+    """Admin payload to create a device model under a brand."""
+
+    brand_id: UUID = Field(..., description="Brand id this model belongs to.")
+    name: str = Field(..., min_length=2, description="Device model name.")
+
+
+class ServiceResponse(BaseModel):
+    """Service record for booking catalog."""
+
+    id: UUID = Field(..., description="Service id.")
+    name: str = Field(..., description="Service name.")
+    base_price: Optional[float] = Field(None, description="Base price (informational).")
+
+
+class ServiceCreateRequest(BaseModel):
+    """Admin payload to create a service."""
+
+    name: str = Field(..., min_length=2, description="Service name.")
+    base_price: Optional[float] = Field(None, ge=0, description="Base price (informational).")
+
+
+class RepairStatusHistoryResponse(BaseModel):
+    """Repair status history record."""
+
+    id: UUID = Field(..., description="History record id.")
+    repair_id: UUID = Field(..., description="Linked repair id.")
+    status: str = Field(..., description="Status value at this point in time.")
+    created_at: Optional[datetime] = Field(None, description="Timestamp of status change.")
 
 
 class SupabaseRestClient:
@@ -332,6 +394,12 @@ async def require_technician_or_admin(user: UserContext = Depends(get_current_us
     return user
 
 
+# PUBLIC_INTERFACE
+async def require_authenticated(user: UserContext = Depends(get_current_user)) -> UserContext:
+    """FastAPI dependency: any authenticated user."""
+    return user
+
+
 @app.get(
     "/",
     tags=["System"],
@@ -354,6 +422,28 @@ async def auth_me(user: UserContext = Depends(get_current_user)) -> UserContext:
     return user
 
 
+@app.get(
+    "/docs/auth",
+    tags=["System"],
+    summary="Auth and role usage guide",
+    description="Helper endpoint describing how to call this API with Supabase JWT and how roles are enforced.",
+    operation_id="docs_auth_guide",
+)
+def docs_auth_guide() -> Dict[str, Any]:
+    return {
+        "authentication": {
+            "type": "Supabase JWT",
+            "header": "Authorization: Bearer <access_token>",
+            "how_to_get_token": "Use Supabase Auth on the frontend to sign in; use the returned access_token.",
+        },
+        "authorization": {
+            "roles": ["customer", "technician", "admin"],
+            "source": "public.profiles.role (looked up using the user's JWT under RLS).",
+            "service_role_note": "Admin endpoints may use SUPABASE_SERVICE_ROLE_KEY server-side to bypass RLS; API enforces admin role.",
+        },
+    }
+
+
 @app.post(
     "/repairs",
     tags=["Repairs"],
@@ -372,7 +462,7 @@ async def create_repair(
 ) -> RepairResponse:
     if _supabase is None:
         raise RuntimeError("Supabase client not initialized.")
-    _require_role(user, ["customer", "admin"])  # admins can create on behalf if RLS allows; otherwise will fail.
+    _require_role(user, ["customer", "admin"])  # admin allowed if RLS permits; otherwise will fail.
 
     headers = _postgrest_headers_from_user(user.access_token)
     rows = await _supabase.insert(
@@ -394,8 +484,7 @@ async def create_repair(
     )
     if not isinstance(rows, list) or not rows:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected create response.")
-    r = rows[0]
-    return RepairResponse(**r)
+    return RepairResponse(**rows[0])
 
 
 @app.get(
@@ -421,6 +510,103 @@ async def list_my_repairs(user: UserContext = Depends(get_current_user)) -> List
     rows = await _supabase.select("repairs", headers=headers, filters=filters, order="created_at.desc")
     if not isinstance(rows, list):
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected list response.")
+    return [RepairResponse(**r) for r in rows]
+
+
+@app.get(
+    "/repairs/{repair_id}",
+    tags=["Repairs"],
+    summary="Get repair by id (RLS-scoped)",
+    description=(
+        "Returns a single repair by id if visible to the current user under Supabase RLS.\n"
+        "Customers typically see their own repairs; technicians see assigned; admins see all."
+    ),
+    operation_id="get_repair",
+    response_model=RepairResponse,
+)
+async def get_repair(repair_id: UUID, user: UserContext = Depends(require_authenticated)) -> RepairResponse:
+    if _supabase is None:
+        raise RuntimeError("Supabase client not initialized.")
+    headers = _postgrest_headers_from_user(user.access_token)
+
+    rows = await _supabase.select(
+        "repairs",
+        headers=headers,
+        filters={"id": f"eq.{repair_id}"},
+        limit=1,
+    )
+    if not isinstance(rows, list):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected response.")
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Repair not found or not permitted by RLS.",
+        )
+    return RepairResponse(**rows[0])
+
+
+@app.get(
+    "/repairs/{repair_id}/history",
+    tags=["Repairs"],
+    summary="Get repair status history (RLS-scoped)",
+    description=(
+        "Returns status history for a repair.\n"
+        "Visibility is enforced by RLS: only users who can see the repair can see its history."
+    ),
+    operation_id="get_repair_history",
+    response_model=List[RepairStatusHistoryResponse],
+)
+async def get_repair_history(
+    repair_id: UUID,
+    user: UserContext = Depends(require_authenticated),
+) -> List[RepairStatusHistoryResponse]:
+    if _supabase is None:
+        raise RuntimeError("Supabase client not initialized.")
+    headers = _postgrest_headers_from_user(user.access_token)
+
+    # In schema, repair_status_history has repair_id FK and RLS aligned with repair visibility.
+    rows = await _supabase.select(
+        "repair_status_history",
+        headers=headers,
+        filters={"repair_id": f"eq.{repair_id}"},
+        order="created_at.desc",
+    )
+    if not isinstance(rows, list):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected response.")
+    return [RepairStatusHistoryResponse(**r) for r in rows]
+
+
+@app.get(
+    "/repairs/jobs",
+    tags=["Repairs"],
+    summary="List repairs for technician/admin",
+    description=(
+        "Technician/admin endpoint to list job repairs.\n"
+        "Technicians will be scoped to assigned jobs by RLS; admins may see all."
+    ),
+    operation_id="list_jobs",
+    response_model=List[RepairResponse],
+)
+async def list_jobs(
+    user: UserContext = Depends(require_technician_or_admin),
+    status_filter: Optional[str] = Query(
+        default=None,
+        description="Optional status filter (exact match).",
+    ),
+) -> List[RepairResponse]:
+    if _supabase is None:
+        raise RuntimeError("Supabase client not initialized.")
+    headers = _postgrest_headers_from_user(user.access_token)
+
+    filters: Dict[str, str] = {}
+    if user.role == "technician":
+        filters["technician_id"] = f"eq.{user.user_id}"
+    if status_filter:
+        filters["status"] = f"eq.{status_filter}"
+
+    rows = await _supabase.select("repairs", headers=headers, filters=filters, order="created_at.desc")
+    if not isinstance(rows, list):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected response.")
     return [RepairResponse(**r) for r in rows]
 
 
@@ -477,7 +663,6 @@ async def admin_assign_technician(
 ) -> RepairResponse:
     if _supabase is None:
         raise RuntimeError("Supabase client not initialized.")
-    # Server enforces admin role via dependency; now perform privileged update.
     headers = _postgrest_headers_service_role()
 
     rows = await _supabase.update(
@@ -489,3 +674,140 @@ async def admin_assign_technician(
     if not isinstance(rows, list) or not rows:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Repair not found.")
     return RepairResponse(**rows[0])
+
+
+@app.get(
+    "/brands",
+    tags=["Catalog"],
+    summary="List brands",
+    description="Returns the list of brands (authenticated users; RLS enforced by Supabase).",
+    operation_id="list_brands",
+    response_model=List[BrandResponse],
+)
+async def list_brands(user: UserContext = Depends(require_authenticated)) -> List[BrandResponse]:
+    if _supabase is None:
+        raise RuntimeError("Supabase client not initialized.")
+    headers = _postgrest_headers_from_user(user.access_token)
+    rows = await _supabase.select("brands", headers=headers, order="name.asc")
+    if not isinstance(rows, list):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected response.")
+    return [BrandResponse(**r) for r in rows]
+
+
+@app.get(
+    "/device-models",
+    tags=["Catalog"],
+    summary="List device models",
+    description="Returns device models, optionally filtered by brand_id (authenticated users; RLS enforced by Supabase).",
+    operation_id="list_device_models",
+    response_model=List[DeviceModelResponse],
+)
+async def list_device_models(
+    user: UserContext = Depends(require_authenticated),
+    brand_id: Optional[UUID] = Query(default=None, description="Optional brand id filter."),
+) -> List[DeviceModelResponse]:
+    if _supabase is None:
+        raise RuntimeError("Supabase client not initialized.")
+    headers = _postgrest_headers_from_user(user.access_token)
+
+    filters: Dict[str, str] = {}
+    if brand_id:
+        filters["brand_id"] = f"eq.{brand_id}"
+
+    rows = await _supabase.select("device_models", headers=headers, filters=filters, order="name.asc")
+    if not isinstance(rows, list):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected response.")
+    return [DeviceModelResponse(**r) for r in rows]
+
+
+@app.get(
+    "/services",
+    tags=["Catalog"],
+    summary="List services",
+    description="Returns services (authenticated users; RLS enforced by Supabase).",
+    operation_id="list_services",
+    response_model=List[ServiceResponse],
+)
+async def list_services(user: UserContext = Depends(require_authenticated)) -> List[ServiceResponse]:
+    if _supabase is None:
+        raise RuntimeError("Supabase client not initialized.")
+    headers = _postgrest_headers_from_user(user.access_token)
+
+    rows = await _supabase.select("services", headers=headers, order="name.asc")
+    if not isinstance(rows, list):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected response.")
+    return [ServiceResponse(**r) for r in rows]
+
+
+@app.post(
+    "/admin/brands",
+    tags=["Admin"],
+    summary="Create brand (admin)",
+    description="Admin-only: create a new brand using service role key (bypasses RLS).",
+    operation_id="admin_create_brand",
+    response_model=BrandResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def admin_create_brand(
+    payload: BrandCreateRequest,
+    admin: UserContext = Depends(require_admin),
+) -> BrandResponse:
+    if _supabase is None:
+        raise RuntimeError("Supabase client not initialized.")
+    headers = _postgrest_headers_service_role()
+    rows = await _supabase.insert("brands", headers=headers, rows=[{"name": payload.name}])
+    if not isinstance(rows, list) or not rows:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected create response.")
+    return BrandResponse(**rows[0])
+
+
+@app.post(
+    "/admin/device-models",
+    tags=["Admin"],
+    summary="Create device model (admin)",
+    description="Admin-only: create a new device model under a brand using service role key (bypasses RLS).",
+    operation_id="admin_create_device_model",
+    response_model=DeviceModelResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def admin_create_device_model(
+    payload: DeviceModelCreateRequest,
+    admin: UserContext = Depends(require_admin),
+) -> DeviceModelResponse:
+    if _supabase is None:
+        raise RuntimeError("Supabase client not initialized.")
+    headers = _postgrest_headers_service_role()
+    rows = await _supabase.insert(
+        "device_models",
+        headers=headers,
+        rows=[{"brand_id": str(payload.brand_id), "name": payload.name}],
+    )
+    if not isinstance(rows, list) or not rows:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected create response.")
+    return DeviceModelResponse(**rows[0])
+
+
+@app.post(
+    "/admin/services",
+    tags=["Admin"],
+    summary="Create service (admin)",
+    description="Admin-only: create a new service using service role key (bypasses RLS).",
+    operation_id="admin_create_service",
+    response_model=ServiceResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def admin_create_service(
+    payload: ServiceCreateRequest,
+    admin: UserContext = Depends(require_admin),
+) -> ServiceResponse:
+    if _supabase is None:
+        raise RuntimeError("Supabase client not initialized.")
+    headers = _postgrest_headers_service_role()
+    rows = await _supabase.insert(
+        "services",
+        headers=headers,
+        rows=[{"name": payload.name, "base_price": payload.base_price}],
+    )
+    if not isinstance(rows, list) or not rows:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected create response.")
+    return ServiceResponse(**rows[0])
