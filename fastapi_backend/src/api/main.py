@@ -1,6 +1,6 @@
 import os
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 from uuid import UUID
 
 import httpx
@@ -104,12 +104,66 @@ class RepairResponse(BaseModel):
     updated_at: Optional[datetime] = Field(None, description="Last update time.")
 
 
+# Allowed statuses should match DB constraint/enum (kept here to provide clear API errors).
+_ALLOWED_REPAIR_STATUSES: Set[str] = {
+    "pending",
+    "accepted",
+    "in_progress",
+    "completed",
+    "cancelled",
+}
+
+
+def _validate_repair_status_value(status_value: str) -> None:
+    """Validate status value and raise a 422 with a helpful message if invalid."""
+    if status_value not in _ALLOWED_REPAIR_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "message": "Invalid status value.",
+                "allowed": sorted(_ALLOWED_REPAIR_STATUSES),
+                "received": status_value,
+            },
+        )
+
+
+def _validate_repair_status_update_permissions(user: UserContext, new_status: str) -> None:
+    """
+    Enforce basic business rules by role.
+
+    Note: RLS remains the source of truth for *which* repair rows a user can modify.
+    This function enforces *what* transitions/values are permitted by role.
+    """
+    # Technicians/admin can update status, but technician shouldn't set "cancelled" (customer/admin action).
+    if user.role == "technician" and new_status == "cancelled":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Technicians cannot set status to 'cancelled'.",
+        )
+
+
 class RepairStatusUpdateRequest(BaseModel):
     """Payload to update a repair's status."""
 
     status: str = Field(
         ...,
-        description="New status (e.g. pending, accepted, in_progress, completed, cancelled).",
+        description="New status (pending, accepted, in_progress, completed, cancelled).",
+    )
+
+
+class AdminRepairAnalyticsResponse(BaseModel):
+    """Admin analytics summary across repairs."""
+
+    total_repairs: int = Field(..., description="Total repairs in the system.")
+    by_status: Dict[str, int] = Field(
+        ..., description="Counts of repairs grouped by status."
+    )
+    by_day_last_14d: List[Dict[str, Any]] = Field(
+        ...,
+        description=(
+            "Daily counts for last 14 days. "
+            "Each item contains: {date: 'YYYY-MM-DD', count: int}."
+        ),
     )
 
 
@@ -617,7 +671,10 @@ async def list_jobs(
     description=(
         "Updates the status of a repair.\n"
         "Technicians can typically update only assigned repairs (enforced by RLS).\n"
-        "Admins can update any repair (if RLS allows; otherwise use admin assignment endpoint with service role)."
+        "Admins can update any repair (if RLS allows; otherwise use admin assignment endpoint with service role).\n\n"
+        "Server-side validation:\n"
+        "- status must be one of the allowed values\n"
+        "- technicians cannot set status to 'cancelled'\n"
     ),
     operation_id="update_repair_status",
     response_model=RepairResponse,
@@ -629,13 +686,18 @@ async def update_repair_status(
 ) -> RepairResponse:
     if _supabase is None:
         raise RuntimeError("Supabase client not initialized.")
+
+    _validate_repair_status_value(payload.status)
+    _validate_repair_status_update_permissions(user, payload.status)
+
     headers = _postgrest_headers_from_user(user.access_token)
 
+    # Let DB triggers manage updated_at and history logging where applicable.
     rows = await _supabase.update(
         "repairs",
         headers=headers,
         filters={"id": f"eq.{repair_id}"},
-        patch={"status": payload.status, "updated_at": datetime.utcnow().isoformat()},
+        patch={"status": payload.status},
     )
     if not isinstance(rows, list) or not rows:
         raise HTTPException(
@@ -809,5 +871,74 @@ async def admin_create_service(
         rows=[{"name": payload.name, "base_price": payload.base_price}],
     )
     if not isinstance(rows, list) or not rows:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected create response.")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected create response."
+        )
     return ServiceResponse(**rows[0])
+
+
+@app.get(
+    "/admin/analytics/repairs",
+    tags=["Admin"],
+    summary="Repairs analytics (admin)",
+    description=(
+        "Admin-only analytics for dashboards.\n"
+        "Uses Supabase service role key to read all repairs (bypasses RLS). "
+        "Therefore the API strictly enforces admin role."
+    ),
+    operation_id="admin_repairs_analytics",
+    response_model=AdminRepairAnalyticsResponse,
+)
+async def admin_repairs_analytics(admin: UserContext = Depends(require_admin)) -> AdminRepairAnalyticsResponse:
+    if _supabase is None:
+        raise RuntimeError("Supabase client not initialized.")
+
+    headers = _postgrest_headers_service_role()
+
+    # 1) Fetch all repairs (id/status/created_at) for aggregation.
+    # For modest data sizes this is fine; for large datasets consider a SQL RPC.
+    rows = await _supabase.select(
+        "repairs",
+        headers=headers,
+        select="id,status,created_at",
+        order="created_at.desc",
+    )
+    if not isinstance(rows, list):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected response."
+        )
+
+    total = len(rows)
+    by_status: Dict[str, int] = {}
+    for r in rows:
+        st = r.get("status") or "unknown"
+        by_status[st] = by_status.get(st, 0) + 1
+
+    # 2) 14d daily counts (in-memory bucketing). created_at may be null in some cases.
+    # We keep response shape stable for frontend charting.
+    today = datetime.utcnow().date()
+    day_buckets: Dict[str, int] = {}
+    for i in range(14):
+        d = (today).fromordinal(today.toordinal() - i)
+        day_buckets[d.isoformat()] = 0
+
+    for r in rows:
+        created_at = r.get("created_at")
+        if not created_at:
+            continue
+        try:
+            # created_at is ISO string from PostgREST
+            d = datetime.fromisoformat(created_at.replace("Z", "+00:00")).date()
+        except Exception:
+            continue
+        key = d.isoformat()
+        if key in day_buckets:
+            day_buckets[key] += 1
+
+    by_day_last_14d = [{"date": k, "count": day_buckets[k]} for k in sorted(day_buckets.keys())]
+
+    return AdminRepairAnalyticsResponse(
+        total_repairs=total,
+        by_status=by_status,
+        by_day_last_14d=by_day_last_14d,
+    )
