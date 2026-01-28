@@ -29,8 +29,10 @@ def _split_origins(raw: str) -> List[str]:
 # Supabase config (required for authenticated endpoints).
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 
-# CORS: in production, set CORS_ALLOW_ORIGINS to your deployed frontend URL(s).
-# Comma-separated, e.g.: "http://localhost:3000,https://app.example.com"
+# CORS:
+# - In production, set CORS_ALLOW_ORIGINS to your deployed frontend URL(s).
+# - Comma-separated, e.g.: "http://localhost:3000,https://app.example.com"
+# - If unset, the API defaults to localhost:3000 origins for development.
 CORS_ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "")
 
 openapi_tags = [
