@@ -3,21 +3,22 @@ from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Set
 from uuid import UUID
 
-import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-
-def _require_env(name: str) -> str:
-    """Fetch a required environment variable or raise a clear startup error."""
-    value = os.getenv(name)
-    if not value:
-        raise RuntimeError(
-            f"Missing required environment variable: {name}. "
-            "Ask the orchestrator to add it to this container's .env."
-        )
-    return value
+from src.api.auth import (
+    UserContext,
+    get_current_user,
+    require_admin,
+    require_authenticated,
+    require_technician_or_admin,
+)
+from src.api.supabase_client import (
+    SupabaseRestClient,
+    postgrest_headers_from_user,
+    postgrest_headers_service_role,
+)
 
 
 def _split_origins(raw: str) -> List[str]:
@@ -27,8 +28,6 @@ def _split_origins(raw: str) -> List[str]:
 
 # Supabase config (required for authenticated endpoints).
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 
 # CORS: in production, set CORS_ALLOW_ORIGINS to your deployed frontend URL(s).
 # Comma-separated, e.g.: "http://localhost:3000,https://app.example.com"
@@ -72,15 +71,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-class UserContext(BaseModel):
-    """User identity and role derived from Supabase Auth + profiles table."""
-
-    user_id: UUID = Field(..., description="Supabase auth user id (auth.users.id).")
-    email: Optional[str] = Field(None, description="User email from Supabase auth.")
-    role: str = Field(..., description="Application role: customer, technician, admin.")
-    access_token: str = Field(..., description="Raw Supabase access token (JWT).")
 
 
 class RepairCreateRequest(BaseModel):
@@ -127,9 +117,7 @@ class AdminRepairAnalyticsResponse(BaseModel):
     by_status: Dict[str, int] = Field(..., description="Counts of repairs grouped by status.")
     by_day_last_14d: List[Dict[str, Any]] = Field(
         ...,
-        description=(
-            "Daily counts for last 14 days. Each item contains: {date: 'YYYY-MM-DD', count: int}."
-        ),
+        description=("Daily counts for last 14 days. Each item contains: {date: 'YYYY-MM-DD', count: int}."),
     )
 
 
@@ -248,193 +236,14 @@ def _validate_repair_status_update_permissions(user: UserContext, new_status: st
         )
 
 
-def _require_supabase_for_user_endpoints() -> None:
-    """Validate required env vars for endpoints that call Supabase with a user JWT."""
-    if not SUPABASE_URL:
-        raise RuntimeError("SUPABASE_URL is not configured. Ask orchestrator to set SUPABASE_URL.")
-    if not SUPABASE_ANON_KEY:
-        raise RuntimeError(
-            "SUPABASE_ANON_KEY is not configured. Ask orchestrator to set SUPABASE_ANON_KEY."
-        )
-
-
-def _require_supabase_service_role() -> None:
-    """Validate required env vars for endpoints that must use the service role."""
-    _require_supabase_for_user_endpoints()
-    if not SUPABASE_SERVICE_ROLE_KEY:
-        raise RuntimeError(
-            "SUPABASE_SERVICE_ROLE_KEY is not configured. Ask orchestrator to set SUPABASE_SERVICE_ROLE_KEY."
-        )
-
-
-class SupabaseRestClient:
-    """Minimal Supabase PostgREST client with correct headers for RLS-aware access."""
-
-    def __init__(self, *, supabase_url: str):
-        if not supabase_url:
-            raise RuntimeError(
-                "SUPABASE_URL is not configured. Ask orchestrator to set SUPABASE_URL."
-            )
-        self._rest_base = f"{supabase_url}/rest/v1"
-
-    async def _request(
-        self,
-        method: str,
-        path: str,
-        *,
-        headers: Dict[str, str],
-        params: Optional[Dict[str, Any]] = None,
-        json: Any = None,
-    ) -> Any:
-        url = f"{self._rest_base}{path}"
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.request(method, url, headers=headers, params=params, json=json)
-        if resp.status_code >= 400:
-            detail: Any
-            try:
-                detail = resp.json()
-            except Exception:
-                detail = resp.text
-            raise HTTPException(status_code=resp.status_code, detail=detail)
-        if resp.status_code == status.HTTP_204_NO_CONTENT:
-            return None
-        try:
-            return resp.json()
-        except Exception as e:
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"Unexpected response from Supabase: {e}",
-            ) from e
-
-    async def select(
-        self,
-        table: str,
-        *,
-        headers: Dict[str, str],
-        filters: Optional[Dict[str, str]] = None,
-        select: str = "*",
-        order: Optional[str] = None,
-        limit: Optional[int] = None,
-    ) -> Any:
-        params: Dict[str, Any] = {"select": select}
-        if filters:
-            params.update(filters)
-        if order:
-            params["order"] = order
-        if limit is not None:
-            params["limit"] = str(limit)
-        return await self._request("GET", f"/{table}", headers=headers, params=params)
-
-    async def insert(
-        self,
-        table: str,
-        *,
-        headers: Dict[str, str],
-        rows: List[Dict[str, Any]],
-        returning: str = "representation",
-    ) -> Any:
-        h = dict(headers)
-        h["Prefer"] = f"return={returning}"
-        return await self._request("POST", f"/{table}", headers=h, json=rows)
-
-    async def update(
-        self,
-        table: str,
-        *,
-        headers: Dict[str, str],
-        filters: Dict[str, str],
-        patch: Dict[str, Any],
-        returning: str = "representation",
-    ) -> Any:
-        params = dict(filters)
-        h = dict(headers)
-        h["Prefer"] = f"return={returning}"
-        return await self._request("PATCH", f"/{table}", headers=h, params=params, json=patch)
-
-
 _supabase = SupabaseRestClient(supabase_url=SUPABASE_URL) if SUPABASE_URL else None
-
-
-def _postgrest_headers_from_user(token: str) -> Dict[str, str]:
-    """
-    Build headers for Supabase PostgREST with the user's JWT.
-    Uses anon key as apikey (required by Supabase gateway) and JWT for RLS.
-    """
-    _require_supabase_for_user_endpoints()
-    return {
-        "apikey": SUPABASE_ANON_KEY,
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-
-
-def _postgrest_headers_service_role() -> Dict[str, str]:
-    """
-    Build headers for Supabase PostgREST using the service role key.
-    IMPORTANT: Only use server-side. This bypasses RLS, so we must enforce role checks in the API.
-    """
-    _require_supabase_service_role()
-    return {
-        "apikey": SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-
-
-async def _get_supabase_user(access_token: str) -> Dict[str, Any]:
-    """Call Supabase Auth API to validate JWT and return user payload."""
-    _require_supabase_for_user_endpoints()
-
-    url = f"{SUPABASE_URL}/auth/v1/user"
-    headers = {
-        "apikey": SUPABASE_ANON_KEY,
-        "Authorization": f"Bearer {access_token}",
-        "Accept": "application/json",
-    }
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(url, headers=headers)
-    if resp.status_code != 200:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired Supabase access token.",
-        )
-    return resp.json()
-
-
-async def _get_user_role(user_id: UUID, access_token: str) -> str:
-    """
-    Determine role from `public.profiles` using the user's JWT.
-    If RLS prevents access or row is missing, default to 'customer' (per schema trigger default).
-    """
-    if _supabase is None:
-        raise RuntimeError("Supabase client not initialized (missing SUPABASE_URL).")
-
-    headers = _postgrest_headers_from_user(access_token)
-    try:
-        rows = await _supabase.select(
-            "profiles",
-            headers=headers,
-            filters={"user_id": f"eq.{user_id}"},
-            select="role",
-            limit=1,
-        )
-        if isinstance(rows, list) and rows:
-            role = rows[0].get("role")
-            if isinstance(role, str) and role:
-                return role
-    except HTTPException:
-        # If profile read fails due to RLS or missing row, keep safe default.
-        pass
-    return "customer"
 
 
 async def _get_repair_current_status(repair_id: UUID, *, access_token: str) -> Optional[str]:
     """Fetch current status of a repair using caller JWT (RLS-scoped)."""
     if _supabase is None:
         raise RuntimeError("Supabase client not initialized.")
-    headers = _postgrest_headers_from_user(access_token)
+    headers = postgrest_headers_from_user(access_token=access_token)
     rows = await _supabase.select(
         "repairs",
         headers=headers,
@@ -469,52 +278,6 @@ def _validate_transition(old_status: str, new_status: str) -> None:
                 "allowed_next": sorted(list(allowed)),
             },
         )
-
-
-# PUBLIC_INTERFACE
-async def get_current_user(authorization: Optional[str] = Header(default=None)) -> UserContext:
-    """FastAPI dependency: validate Supabase JWT and return user context (id/email/role)."""
-    if not authorization:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing Authorization header.",
-        )
-    parts = authorization.split(" ", 1)
-    if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1].strip():
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid Authorization header format. Expected: Bearer <token>",
-        )
-    token = parts[1].strip()
-    supa_user = await _get_supabase_user(token)
-    user_id = UUID(supa_user["id"])
-    role = await _get_user_role(user_id, token)
-    return UserContext(
-        user_id=user_id,
-        email=supa_user.get("email"),
-        role=role,
-        access_token=token,
-    )
-
-
-# PUBLIC_INTERFACE
-async def require_admin(user: UserContext = Depends(get_current_user)) -> UserContext:
-    """FastAPI dependency: require admin role."""
-    _require_role(user, ["admin"])
-    return user
-
-
-# PUBLIC_INTERFACE
-async def require_technician_or_admin(user: UserContext = Depends(get_current_user)) -> UserContext:
-    """FastAPI dependency: allow technician or admin."""
-    _require_role(user, ["technician", "admin"])
-    return user
-
-
-# PUBLIC_INTERFACE
-async def require_authenticated(user: UserContext = Depends(get_current_user)) -> UserContext:
-    """FastAPI dependency: any authenticated user."""
-    return user
 
 
 @app.get(
@@ -594,7 +357,7 @@ async def create_repair(
         raise RuntimeError("Supabase client not initialized.")
     _require_role(user, ["customer", "admin"])  # admin allowed if RLS permits; otherwise will fail.
 
-    headers = _postgrest_headers_from_user(user.access_token)
+    headers = postgrest_headers_from_user(access_token=user.access_token)
     rows = await _supabase.insert(
         "repairs",
         headers=headers,
@@ -628,7 +391,7 @@ async def create_repair(
 async def list_my_repairs(user: UserContext = Depends(get_current_user)) -> List[RepairResponse]:
     if _supabase is None:
         raise RuntimeError("Supabase client not initialized.")
-    headers = _postgrest_headers_from_user(user.access_token)
+    headers = postgrest_headers_from_user(access_token=user.access_token)
 
     # RLS will already scope results. We still add role-specific filters for efficiency/clarity.
     filters: Dict[str, str] = {}
@@ -657,7 +420,7 @@ async def list_my_repairs(user: UserContext = Depends(get_current_user)) -> List
 async def get_repair(repair_id: UUID, user: UserContext = Depends(require_authenticated)) -> RepairResponse:
     if _supabase is None:
         raise RuntimeError("Supabase client not initialized.")
-    headers = _postgrest_headers_from_user(user.access_token)
+    headers = postgrest_headers_from_user(access_token=user.access_token)
 
     rows = await _supabase.select(
         "repairs",
@@ -692,7 +455,7 @@ async def get_repair_history(
 ) -> List[RepairStatusHistoryResponse]:
     if _supabase is None:
         raise RuntimeError("Supabase client not initialized.")
-    headers = _postgrest_headers_from_user(user.access_token)
+    headers = postgrest_headers_from_user(access_token=user.access_token)
 
     rows = await _supabase.select(
         "repair_status_history",
@@ -722,7 +485,7 @@ async def list_jobs(
 ) -> List[RepairResponse]:
     if _supabase is None:
         raise RuntimeError("Supabase client not initialized.")
-    headers = _postgrest_headers_from_user(user.access_token)
+    headers = postgrest_headers_from_user(access_token=user.access_token)
 
     filters: Dict[str, str] = {}
     if user.role == "technician":
@@ -776,7 +539,7 @@ async def update_repair_status(
 
     _validate_transition(current_status, payload.status)
 
-    headers = _postgrest_headers_from_user(user.access_token)
+    headers = postgrest_headers_from_user(access_token=user.access_token)
 
     # Let DB triggers manage updated_at and history logging.
     rows = await _supabase.update(
@@ -811,7 +574,7 @@ async def admin_assign_technician(
 ) -> RepairResponse:
     if _supabase is None:
         raise RuntimeError("Supabase client not initialized.")
-    headers = _postgrest_headers_service_role()
+    headers = postgrest_headers_service_role()
 
     # Do NOT override updated_at in API; rely on DB triggers/defaults for consistency.
     rows = await _supabase.update(
@@ -836,7 +599,7 @@ async def admin_assign_technician(
 async def list_brands(user: UserContext = Depends(require_authenticated)) -> List[BrandResponse]:
     if _supabase is None:
         raise RuntimeError("Supabase client not initialized.")
-    headers = _postgrest_headers_from_user(user.access_token)
+    headers = postgrest_headers_from_user(access_token=user.access_token)
     rows = await _supabase.select("brands", headers=headers, order="name.asc")
     if not isinstance(rows, list):
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected response.")
@@ -857,7 +620,7 @@ async def list_device_models(
 ) -> List[DeviceModelResponse]:
     if _supabase is None:
         raise RuntimeError("Supabase client not initialized.")
-    headers = _postgrest_headers_from_user(user.access_token)
+    headers = postgrest_headers_from_user(access_token=user.access_token)
 
     filters: Dict[str, str] = {}
     if brand_id:
@@ -880,7 +643,7 @@ async def list_device_models(
 async def list_services(user: UserContext = Depends(require_authenticated)) -> List[ServiceResponse]:
     if _supabase is None:
         raise RuntimeError("Supabase client not initialized.")
-    headers = _postgrest_headers_from_user(user.access_token)
+    headers = postgrest_headers_from_user(access_token=user.access_token)
 
     rows = await _supabase.select("services", headers=headers, order="name.asc")
     if not isinstance(rows, list):
@@ -903,7 +666,7 @@ async def admin_create_brand(
 ) -> BrandResponse:
     if _supabase is None:
         raise RuntimeError("Supabase client not initialized.")
-    headers = _postgrest_headers_service_role()
+    headers = postgrest_headers_service_role()
     rows = await _supabase.insert("brands", headers=headers, rows=[{"name": payload.name}])
     if not isinstance(rows, list) or not rows:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected create response.")
@@ -925,7 +688,7 @@ async def admin_create_device_model(
 ) -> DeviceModelResponse:
     if _supabase is None:
         raise RuntimeError("Supabase client not initialized.")
-    headers = _postgrest_headers_service_role()
+    headers = postgrest_headers_service_role()
     rows = await _supabase.insert(
         "device_models",
         headers=headers,
@@ -951,7 +714,7 @@ async def admin_create_service(
 ) -> ServiceResponse:
     if _supabase is None:
         raise RuntimeError("Supabase client not initialized.")
-    headers = _postgrest_headers_service_role()
+    headers = postgrest_headers_service_role()
     rows = await _supabase.insert(
         "services",
         headers=headers,
@@ -987,7 +750,7 @@ async def admin_repairs_analytics(admin: UserContext = Depends(require_admin)) -
     if _supabase is None:
         raise RuntimeError("Supabase client not initialized.")
 
-    headers = _postgrest_headers_service_role()
+    headers = postgrest_headers_service_role()
 
     rows = await _supabase.select(
         "repairs",
