@@ -1,5 +1,6 @@
 import os
 from datetime import date, datetime, timedelta
+from math import asin, cos, radians, sin, sqrt
 from typing import Any, Dict, List, Optional, Set, Union
 from uuid import UUID
 
@@ -45,6 +46,10 @@ openapi_tags = [
     {
         "name": "Catalog",
         "description": "Read-only catalog data (brands, device models, services) used by booking flow.",
+    },
+    {
+        "name": "Service Centers",
+        "description": "Service center locator endpoints used by the Find a Service Center page.",
     },
     {"name": "Repairs", "description": "Customer booking and tracking, technician status updates."},
     {"name": "Admin", "description": "Administrative repair assignment and catalog management."},
@@ -203,6 +208,26 @@ class RepairStatusHistoryResponse(BaseModel):
     created_at: Optional[datetime] = Field(None, description="Timestamp of status change.")
 
 
+class ServiceCenterResponse(BaseModel):
+    """Service center record for the locator UI."""
+
+    id: UUID = Field(..., description="Service center id.")
+    name: str = Field(..., description="Service center name.")
+    category: str = Field(..., description="Product category supported by this center.")
+    city: str = Field(..., description="City/town.")
+    pincode: str = Field(..., description="Postal code/pincode.")
+    lat: float = Field(..., description="Latitude.")
+    lng: float = Field(..., description="Longitude.")
+    phone: str = Field(..., description="Contact phone number.")
+
+
+class ServiceCenterSearchResponse(BaseModel):
+    """Response envelope for service center search results."""
+
+    centers: List[ServiceCenterResponse] = Field(..., description="Matched service centers (sorted by distance when applicable).")
+    query: Dict[str, Any] = Field(..., description="Echo of the parsed search query for debugging/telemetry.")
+
+
 # Allowed statuses should match DB constraint/enum (kept here to provide clear API errors).
 _ALLOWED_REPAIR_STATUSES: Set[str] = {
     "pending",
@@ -301,6 +326,35 @@ def _validate_transition(old_status: str, new_status: str) -> None:
                 "to": new_status,
                 "allowed_next": sorted(list(allowed)),
             },
+        )
+
+
+def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """
+    Compute the great-circle distance between two points in kilometers.
+
+    Uses the haversine formula. Assumes WGS84 coordinates.
+    """
+    r = 6371.0
+    dlat = radians(lat2 - lat1)
+    dlng = radians(lng2 - lng1)
+    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlng / 2) ** 2
+    c = 2 * asin(sqrt(a))
+    return r * c
+
+
+def _parse_optional_float(value: Optional[str], *, field_name: str) -> Optional[float]:
+    """Parse optional float query parameters with clear 422 errors."""
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    try:
+        return float(value)
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid float for '{field_name}': {value}",
         )
 
 
@@ -636,6 +690,124 @@ async def admin_assign_technician(
     if not isinstance(rows, list) or not rows:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Repair not found.")
     return RepairResponse(**rows[0])
+
+
+@app.get(
+    "/service-centers",
+    tags=["Service Centers"],
+    summary="Search service centers",
+    description=(
+        "Search service centers for the locator UI.\n\n"
+        "Filtering:\n"
+        "- category: exact match (e.g. 'Mobile Phone')\n"
+        "- city: case-insensitive match (best-effort by normalizing to lower-case in API)\n"
+        "- pincode: exact match\n\n"
+        "Radius search:\n"
+        "- Provide lat,lng (from geolocation or geocoding) and radius (km).\n"
+        "- If lat/lng are provided, results are sorted by computed distance.\n\n"
+        "Auth:\n"
+        "- Requires an authenticated user (matches existing Catalog endpoints).\n"
+        "- Reads via Supabase PostgREST using the user's JWT (RLS-aware).\n"
+    ),
+    operation_id="search_service_centers",
+    response_model=ServiceCenterSearchResponse,
+)
+# PUBLIC_INTERFACE
+async def search_service_centers(
+    user: UserContext = Depends(require_authenticated),
+    category: Optional[str] = Query(default=None, description="Optional category filter (exact match)."),
+    city: Optional[str] = Query(default=None, description="Optional city/town filter."),
+    pincode: Optional[str] = Query(default=None, description="Optional pincode filter (exact match)."),
+    radius: Optional[int] = Query(default=None, ge=1, le=200, description="Optional radius in km (requires lat & lng)."),
+    lat: Optional[str] = Query(default=None, description="Optional latitude (requires lng if provided)."),
+    lng: Optional[str] = Query(default=None, description="Optional longitude (requires lat if provided)."),
+) -> ServiceCenterSearchResponse:
+    """
+    Search service centers.
+
+    Parameters:
+      - category: product category (exact match)
+      - city: city/town (best-effort match)
+      - pincode: postal code/pincode (exact match)
+      - lat/lng: coordinates to compute distance (and enable radius filtering)
+      - radius: distance in km (works only with lat/lng)
+
+    Returns:
+      - ServiceCenterSearchResponse containing `centers` and an echoed `query`.
+    """
+    if _supabase is None:
+        raise RuntimeError("Supabase client not initialized.")
+
+    # Parse coordinates (strings to allow empty input gracefully and produce clean 422 errors).
+    lat_f = _parse_optional_float(lat, field_name="lat")
+    lng_f = _parse_optional_float(lng, field_name="lng")
+    if (lat_f is None) ^ (lng_f is None):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="lat and lng must be provided together.",
+        )
+    if radius is not None and (lat_f is None or lng_f is None):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="radius requires lat and lng.",
+        )
+
+    headers = postgrest_headers_from_user(access_token=user.access_token)
+
+    # NOTE: PostgREST filters are limited; we keep server-side normalization lightweight.
+    # If you want robust city search (partial match), add an RPC or full-text index later.
+    filters: Dict[str, str] = {}
+    if category:
+        filters["category"] = f"eq.{category}"
+    if pincode:
+        filters["pincode"] = f"eq.{pincode}"
+    if city and city.strip():
+        # Try case-insensitive match via ilike on PostgREST if supported.
+        # If your Supabase PostgREST doesn't support ilike, change to `eq.` and store normalized city.
+        filters["city"] = f"ilike.{city.strip()}"
+
+    rows = await _supabase.select(
+        "service_centers",
+        headers=headers,
+        filters=filters,
+        order="name.asc",
+    )
+    if not isinstance(rows, list):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected response.")
+
+    # Apply radius filtering and distance sorting in API layer (simple + deterministic for small datasets).
+    centers_with_distance: List[Dict[str, Any]] = []
+    for r in rows:
+        try:
+            center = ServiceCenterResponse(**r)
+        except Exception:
+            # Skip malformed rows rather than failing the whole response.
+            continue
+
+        dist_km: Optional[float] = None
+        if lat_f is not None and lng_f is not None:
+            dist_km = _haversine_km(lat_f, lng_f, center.lat, center.lng)
+
+        if radius is not None and dist_km is not None and dist_km > float(radius):
+            continue
+
+        centers_with_distance.append({"center": center, "distance_km": dist_km})
+
+    if lat_f is not None and lng_f is not None:
+        centers_with_distance.sort(key=lambda x: (x["distance_km"] is None, x["distance_km"] or 1e9))
+
+    return ServiceCenterSearchResponse(
+        centers=[x["center"] for x in centers_with_distance],
+        query={
+            "category": category,
+            "city": city,
+            "pincode": pincode,
+            "radius": radius,
+            "lat": lat_f,
+            "lng": lng_f,
+            "returned": len(centers_with_distance),
+        },
+    )
 
 
 @app.get(
