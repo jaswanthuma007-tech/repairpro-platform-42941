@@ -8,7 +8,8 @@ This module provides reusable FastAPI dependencies that:
 
 Environment variables (set in container .env by orchestrator):
 - SUPABASE_URL
-- SUPABASE_ANON_KEY
+- SUPABASE_ANON_KEY (preferred)
+- SUPABASE_KEY (legacy alias for SUPABASE_ANON_KEY; used by this repo's .env)
 """
 
 from __future__ import annotations
@@ -27,14 +28,16 @@ from src.api.supabase_client import SupabaseRestClient, postgrest_headers_from_u
 def _require_supabase_env() -> tuple[str, str]:
     """Return (SUPABASE_URL, SUPABASE_ANON_KEY) or raise a clear configuration error."""
     supabase_url = (os.getenv("SUPABASE_URL") or "").rstrip("/")
-    anon_key = os.getenv("SUPABASE_ANON_KEY") or ""
+    # Accept legacy SUPABASE_KEY to match this repo's .env and prevent runtime failures.
+    anon_key = os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_KEY") or ""
     if not supabase_url:
         raise RuntimeError(
             "SUPABASE_URL is not configured. Ask the orchestrator to set SUPABASE_URL in this container's .env."
         )
     if not anon_key:
         raise RuntimeError(
-            "SUPABASE_ANON_KEY is not configured. Ask the orchestrator to set SUPABASE_ANON_KEY in this container's .env."
+            "SUPABASE_ANON_KEY (or legacy SUPABASE_KEY) is not configured. "
+            "Ask the orchestrator to set it in this container's .env."
         )
     return supabase_url, anon_key
 

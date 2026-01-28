@@ -7,7 +7,8 @@ This module centralizes:
 
 Environment variables (set in container .env by orchestrator):
 - SUPABASE_URL
-- SUPABASE_ANON_KEY
+- SUPABASE_ANON_KEY (preferred)
+- SUPABASE_KEY (legacy alias for SUPABASE_ANON_KEY; used by this repo's .env)
 - SUPABASE_SERVICE_ROLE_KEY (only needed for admin/service endpoints)
 """
 
@@ -31,6 +32,16 @@ def _require_env(name: str) -> str:
     return value
 
 
+def _require_anon_key() -> str:
+    """
+    Return the Supabase anon key.
+
+    This repo historically used SUPABASE_KEY in some environments; newer code expects
+    SUPABASE_ANON_KEY. We accept either to avoid runtime 500s.
+    """
+    return os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_KEY") or ""
+
+
 def _supabase_url() -> str:
     return (os.getenv("SUPABASE_URL") or "").rstrip("/")
 
@@ -47,7 +58,12 @@ def postgrest_headers_from_user(*, access_token: str) -> Dict[str, str]:
     supabase_url = _supabase_url()
     if not supabase_url:
         raise RuntimeError("SUPABASE_URL is not configured. Ask orchestrator to set SUPABASE_URL.")
-    anon_key = _require_env("SUPABASE_ANON_KEY")
+    anon_key = _require_anon_key()
+    if not anon_key:
+        raise RuntimeError(
+            "Missing required environment variable: SUPABASE_ANON_KEY (or legacy SUPABASE_KEY). "
+            "Ask the orchestrator to add it to this container's .env."
+        )
 
     return {
         "apikey": anon_key,

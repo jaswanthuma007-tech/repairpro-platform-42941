@@ -565,8 +565,7 @@ async def create_repair(
     response_model=List[RepairResponse],
 )
 async def list_my_repairs(user: UserContext = Depends(get_current_user)) -> List[RepairResponse]:
-    if _supabase is None:
-        raise RuntimeError("Supabase client not initialized.")
+    supabase = _get_supabase()
     headers = postgrest_headers_from_user(access_token=user.access_token)
 
     # RLS will already scope results. We still add role-specific filters for efficiency/clarity.
@@ -900,9 +899,12 @@ async def api_list_brands() -> List[ApiBrandResponse]:
     supabase = _get_supabase()
 
     # Public read: use anon key without requiring a user JWT.
-    anon_key = os.getenv("SUPABASE_ANON_KEY") or ""
+    anon_key = os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_KEY") or ""
     if not anon_key:
-        raise RuntimeError("SUPABASE_ANON_KEY is not configured. Ask orchestrator to set SUPABASE_ANON_KEY.")
+        raise RuntimeError(
+            "SUPABASE_ANON_KEY (or legacy SUPABASE_KEY) is not configured. "
+            "Ask orchestrator to set it."
+        )
 
     headers = {
         "apikey": anon_key,
@@ -969,12 +971,15 @@ async def api_list_models(brand_id: Optional[UUID] = Query(default=None, descrip
 # PUBLIC_INTERFACE
 async def api_list_issues() -> List[ApiIssueResponse]:
     """Return issues for Step 3 of booking flow (no auth required)."""
-    if _supabase is None:
-        raise RuntimeError("Supabase client not initialized.")
+    supabase = _get_supabase()
 
-    anon_key = os.getenv("SUPABASE_ANON_KEY") or ""
+    # Accept legacy SUPABASE_KEY (repo .env) as well as SUPABASE_ANON_KEY.
+    anon_key = os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_KEY") or ""
     if not anon_key:
-        raise RuntimeError("SUPABASE_ANON_KEY is not configured. Ask orchestrator to set SUPABASE_ANON_KEY.")
+        raise RuntimeError(
+            "SUPABASE_ANON_KEY (or legacy SUPABASE_KEY) is not configured. "
+            "Ask orchestrator to set it."
+        )
 
     headers = {
         "apikey": anon_key,
@@ -1013,7 +1018,7 @@ async def api_create_repair(
     headers = postgrest_headers_from_user(access_token=user.access_token)
     status_value = (payload.status or "pending").strip() or "pending"
 
-    rows = await _supabase.insert(
+    rows = await supabase.insert(
         "repairs",
         headers=headers,
         rows=[
