@@ -84,9 +84,14 @@ _env_frontend_origins = _split_origins(REACT_APP_FRONTEND_URL)
 # (Keeping the variable read above to help operators discover misconfiguration via /docs/auth.)
 _allowed_origins = _split_origins(CORS_ALLOW_ORIGINS) or _env_frontend_origins or _default_dev_origins
 
+# Allow any kavia preview origin (requested): https://*.kavia.ai
+# Starlette supports regex-based origin matching via allow_origin_regex.
+_kavia_origin_regex = r"^https://.*\.kavia\.ai$"
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins,
+    allow_origin_regex=_kavia_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -226,6 +231,53 @@ class ServiceCenterSearchResponse(BaseModel):
 
     centers: List[ServiceCenterResponse] = Field(..., description="Matched service centers (sorted by distance when applicable).")
     query: Dict[str, Any] = Field(..., description="Echo of the parsed search query for debugging/telemetry.")
+
+
+# --- Booking flow (user_input_ref) models for /api/* endpoints ---
+
+class ApiBrandResponse(BaseModel):
+    """Brand record for the /api/brands endpoint (user-request schema)."""
+
+    id: UUID = Field(..., description="Brand id.")
+    name: str = Field(..., description="Brand name.")
+
+
+class ApiModelResponse(BaseModel):
+    """Model record for the /api/models endpoint (user-request schema)."""
+
+    id: UUID = Field(..., description="Model id.")
+    brand_id: UUID = Field(..., description="Brand id this model belongs to.")
+    name: str = Field(..., description="Model name.")
+
+
+class ApiIssueResponse(BaseModel):
+    """Issue record for the /api/issues endpoint (user-request schema)."""
+
+    id: UUID = Field(..., description="Issue id.")
+    name: str = Field(..., description="Issue name.")
+
+
+class ApiRepairCreateRequest(BaseModel):
+    """Payload for creating a repair booking via /api/repairs (user-request schema)."""
+
+    brand_id: UUID = Field(..., description="Selected brand id.")
+    model_id: UUID = Field(..., description="Selected model id.")
+    issue_id: Optional[UUID] = Field(None, description="Selected issue id (optional).")
+    address: str = Field(..., min_length=5, description="Service address.")
+    status: Optional[str] = Field(None, description="Optional initial status; defaults to 'pending'.")
+
+
+class ApiRepairResponse(BaseModel):
+    """Repair record returned by /api/repairs (user-request schema)."""
+
+    id: UUID = Field(..., description="Repair id.")
+    user_id: UUID = Field(..., description="Booking user id.")
+    brand_id: UUID = Field(..., description="Brand id.")
+    model_id: UUID = Field(..., description="Model id.")
+    issue_id: Optional[UUID] = Field(None, description="Issue id.")
+    address: str = Field(..., description="Service address.")
+    status: str = Field(..., description="Current status.")
+    created_at: Optional[datetime] = Field(None, description="Creation timestamp.")
 
 
 # Allowed statuses should match DB constraint/enum (kept here to provide clear API errors).
@@ -808,6 +860,160 @@ async def search_service_centers(
             "returned": len(centers_with_distance),
         },
     )
+
+
+@app.get(
+    "/api/brands",
+    tags=["Catalog"],
+    summary="List brands (public booking catalog)",
+    description=(
+        "User-request booking catalog endpoint.\n\n"
+        "Reads from `public.brands` using the Supabase anon key.\n"
+        "Requires Supabase RLS policy allowing public SELECT on brands."
+    ),
+    operation_id="api_list_brands",
+    response_model=List[ApiBrandResponse],
+)
+# PUBLIC_INTERFACE
+async def api_list_brands() -> List[ApiBrandResponse]:
+    """Return brands for Step 1 of booking flow (no auth required)."""
+    if _supabase is None:
+        raise RuntimeError("Supabase client not initialized.")
+
+    # Public read: use anon key without requiring a user JWT.
+    anon_key = os.getenv("SUPABASE_ANON_KEY") or ""
+    if not anon_key:
+        raise RuntimeError("SUPABASE_ANON_KEY is not configured. Ask orchestrator to set SUPABASE_ANON_KEY.")
+
+    headers = {
+        "apikey": anon_key,
+        "Authorization": f"Bearer {anon_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    rows = await _supabase.select("brands", headers=headers, order="name.asc")
+    if not isinstance(rows, list):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected response.")
+    return [ApiBrandResponse(**r) for r in rows]
+
+
+@app.get(
+    "/api/models",
+    tags=["Catalog"],
+    summary="List models by brand (public booking catalog)",
+    description=(
+        "User-request booking catalog endpoint.\n\n"
+        "Reads from `public.models`, optionally filtered by `brand_id`.\n"
+        "Requires Supabase RLS policy allowing public SELECT on models."
+    ),
+    operation_id="api_list_models",
+    response_model=List[ApiModelResponse],
+)
+# PUBLIC_INTERFACE
+async def api_list_models(brand_id: Optional[UUID] = Query(default=None, description="Brand id filter (UUID).")) -> List[ApiModelResponse]:
+    """Return models for Step 2 of booking flow (no auth required)."""
+    if _supabase is None:
+        raise RuntimeError("Supabase client not initialized.")
+
+    anon_key = os.getenv("SUPABASE_ANON_KEY") or ""
+    if not anon_key:
+        raise RuntimeError("SUPABASE_ANON_KEY is not configured. Ask orchestrator to set SUPABASE_ANON_KEY.")
+
+    headers = {
+        "apikey": anon_key,
+        "Authorization": f"Bearer {anon_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    filters: Dict[str, str] = {}
+    if brand_id:
+        filters["brand_id"] = f"eq.{brand_id}"
+
+    rows = await _supabase.select("models", headers=headers, filters=filters, order="name.asc")
+    if not isinstance(rows, list):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected response.")
+    return [ApiModelResponse(**r) for r in rows]
+
+
+@app.get(
+    "/api/issues",
+    tags=["Catalog"],
+    summary="List issues (public booking catalog)",
+    description=(
+        "User-request booking catalog endpoint.\n\n"
+        "Reads from `public.issues` (no filter).\n"
+        "Requires Supabase RLS policy allowing public SELECT on issues."
+    ),
+    operation_id="api_list_issues",
+    response_model=List[ApiIssueResponse],
+)
+# PUBLIC_INTERFACE
+async def api_list_issues() -> List[ApiIssueResponse]:
+    """Return issues for Step 3 of booking flow (no auth required)."""
+    if _supabase is None:
+        raise RuntimeError("Supabase client not initialized.")
+
+    anon_key = os.getenv("SUPABASE_ANON_KEY") or ""
+    if not anon_key:
+        raise RuntimeError("SUPABASE_ANON_KEY is not configured. Ask orchestrator to set SUPABASE_ANON_KEY.")
+
+    headers = {
+        "apikey": anon_key,
+        "Authorization": f"Bearer {anon_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    rows = await _supabase.select("issues", headers=headers, order="name.asc")
+    if not isinstance(rows, list):
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected response.")
+    return [ApiIssueResponse(**r) for r in rows]
+
+
+@app.post(
+    "/api/repairs",
+    tags=["Repairs"],
+    summary="Create a repair booking (customer, user-request schema)",
+    description=(
+        "User-request booking submission endpoint.\n\n"
+        "Inserts into `public.repairs` with columns: user_id, brand_id, model_id, issue_id, address, status.\n"
+        "Requires authenticated user (Supabase JWT) and RLS policy allowing insert when user_id = auth.uid()."
+    ),
+    operation_id="api_create_repair",
+    response_model=ApiRepairResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+# PUBLIC_INTERFACE
+async def api_create_repair(
+    payload: ApiRepairCreateRequest,
+    user: UserContext = Depends(require_authenticated),
+) -> ApiRepairResponse:
+    """Create a repair booking for the current user under the user-request schema."""
+    if _supabase is None:
+        raise RuntimeError("Supabase client not initialized.")
+
+    headers = postgrest_headers_from_user(access_token=user.access_token)
+    status_value = (payload.status or "pending").strip() or "pending"
+
+    rows = await _supabase.insert(
+        "repairs",
+        headers=headers,
+        rows=[
+            {
+                "user_id": str(user.user_id),
+                "brand_id": str(payload.brand_id),
+                "model_id": str(payload.model_id),
+                "issue_id": str(payload.issue_id) if payload.issue_id else None,
+                "address": payload.address,
+                "status": status_value,
+            }
+        ],
+    )
+
+    if not isinstance(rows, list) or not rows:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Unexpected create response.")
+    return ApiRepairResponse(**rows[0])
 
 
 @app.get(
